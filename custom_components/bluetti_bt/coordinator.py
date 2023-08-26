@@ -145,6 +145,9 @@ class PollingCoordinator(DataUpdateCoordinator):
 
         # Add or modify device fields
         self.bluetti_device = DummyDevice(bluetti_device)
+        
+        self.client = None
+        self.connected = False
 
     async def _async_update_data(self):
         """Fetch data from API endpoint.
@@ -154,29 +157,32 @@ class PollingCoordinator(DataUpdateCoordinator):
         """
         self.hass.data[DOMAIN][self.config_entry.entry_id][DATA_POLLING_RUNNING] = True
 
+        if self.client is None:
+            self.logger.debug("Establishing connection")
+            device = bluetooth.async_ble_device_from_address(self.hass, self._address)
+            if device is None:
+                self.logger.error("Device %s not available", self._address)
+                return None
+    
+            if self.bluetti_device is None:
+                self.logger.error("Device type for %s not found", self._address)
+                return None
+    
+            self.logger.debug("Device (%s) is available with type(%s)", device, self.bluetti_device.type)
+            self.client = BleakClient(device)
+        
         self.logger.debug("Polling data")
-
-        device = bluetooth.async_ble_device_from_address(self.hass, self._address)
-        if device is None:
-            self.logger.error("Device %s not available", self._address)
-            return None
-
-        if self.bluetti_device is None:
-            self.logger.error("Device type for %s not found", self._address)
-            return None
-
-        # Polling
-        client = BleakClient(device)
         parsed_data: dict = {}
 
+        connectError = True
         try:
             async with async_timeout.timeout(15):
-                await client.connect()
-
-                await client.start_notify(
+                if self.connected is False:
+                  await self.client.connect()
+                
+                await self.client.start_notify(
                     BluetoothClient.NOTIFY_UUID, self._notification_handler
                 )
-
                 for command in self.bluetti_device.polling_commands:
                     try:
                         # Prepare to make request
@@ -186,7 +192,7 @@ class PollingCoordinator(DataUpdateCoordinator):
 
                         # Make request
                         self.logger.debug("Requesting %s", command)
-                        await client.write_gatt_char(
+                        await self.client.write_gatt_char(
                             BluetoothClient.WRITE_UUID, bytes(command)
                         )
 
@@ -206,6 +212,9 @@ class PollingCoordinator(DataUpdateCoordinator):
                         self.logger.debug("Parsed data: %s", parsed)
                         parsed_data.update(parsed)
 
+                        connectError = False
+                        self.connected = True
+                        
                     except TimeoutError:
                         self.logger.warning(
                             "Polling timed out (address: %s)", self._address
@@ -224,16 +233,25 @@ class PollingCoordinator(DataUpdateCoordinator):
                         )
         except TimeoutError:
             self.logger.warning("Polling timed out for device %s", self._address)
-            return None
         except BleakError as err:
             self.logger.warning("Bleak error: %s", err)
-            return None
         finally:
-            await client.disconnect()
-
-        self.hass.data[DOMAIN][self.config_entry.entry_id][DATA_POLLING_RUNNING] = False
+            self.hass.data[DOMAIN][self.config_entry.entry_id][DATA_POLLING_RUNNING] = False
+        
+        if connectError:
+            await asyncio.sleep(2)
+            try:
+                response = await self.client.disconnect()  #self.client is the BleakClient 
+                self.logger.debug("DISCONNECT RESPONSE: %s", response)
+            except BleakError:
+                self.logger.error("Device couldn't be disconnected")
+            await asyncio.sleep(2)
+            self.client = None
+            self.connected = False
+            return None
 
         # Pass data back to sensors
+        self.logger.debug("Successfully Polled (%s)", self.bluetti_device.type)
         return parsed_data
 
     def _notification_handler(self, _sender: int, data: bytearray):
